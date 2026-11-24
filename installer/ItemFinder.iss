@@ -41,9 +41,6 @@ RestartApplications=no
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
-[Tasks]
-Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
-
 [InstallDelete]
 ; Remove the previous version's program files so old libraries don't linger.
 ; (Your photo index and AI model live in %LOCALAPPDATA%\ItemFinder and are kept.)
@@ -54,7 +51,7 @@ Source: "..\dist\ItemFinder\*"; DestDir: "{app}"; Flags: ignoreversion recursesu
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; Tasks: desktopicon
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"
 
 [Run]
 ; Normal install: offer to launch at the end.
