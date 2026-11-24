@@ -1084,7 +1084,15 @@ class MainWindow(QMainWindow):
 
 
 STYLE = """
-QWidget { font-size: 10pt; }
+QWidget { font-size: 10pt; color: #1f2328; }
+QWidget:disabled { color: #a0a4a8; }
+QMainWindow, QDialog, QTabWidget::pane, QTabBar::tab { background: #f6f7f9; }
+QTabBar::tab { padding: 6px 14px; border: 1px solid #dee2e6; border-bottom: none;
+               border-top-left-radius: 6px; border-top-right-radius: 6px; margin-right: 2px; }
+QTabBar::tab:selected { background: #ffffff; font-weight: 600; }
+QLineEdit, QSpinBox, QComboBox { background: #ffffff; border: 1px solid #c8ccd2; border-radius: 5px; padding: 3px 6px; }
+QComboBox QAbstractItemView { background: #ffffff; selection-background-color: #dbe9ff; }
+QToolTip { background: #ffffff; color: #1f2328; border: 1px solid #c8ccd2; }
 QPushButton { padding: 6px 12px; border: 1px solid #c8ccd2; border-radius: 6px; background: #fff; }
 QPushButton:hover { background: #f1f3f5; }
 QPushButton:disabled { color: #a0a4a8; }
@@ -1141,6 +1149,32 @@ def _selftest(out_path: str) -> int:
     return code
 
 
+def apply_light_theme(app):
+    """Always use a light theme. Windows dark mode otherwise switches Qt to
+    white text, which is unreadable on the app's light buttons and lists."""
+    from PySide6.QtGui import QPalette
+
+    try:
+        app.styleHints().setColorScheme(Qt.ColorScheme.Light)  # Qt 6.8+
+    except Exception:
+        pass
+    text, dim = QColor("#1f2328"), QColor("#a0a4a8")
+    pal = QPalette()
+    for role, col in [
+        (QPalette.Window, "#f6f7f9"), (QPalette.WindowText, "#1f2328"),
+        (QPalette.Base, "#ffffff"), (QPalette.AlternateBase, "#f1f3f5"),
+        (QPalette.Text, "#1f2328"), (QPalette.Button, "#ffffff"),
+        (QPalette.ButtonText, "#1f2328"), (QPalette.BrightText, "#c62828"),
+        (QPalette.Highlight, "#1f6feb"), (QPalette.HighlightedText, "#ffffff"),
+        (QPalette.ToolTipBase, "#ffffff"), (QPalette.ToolTipText, "#1f2328"),
+        (QPalette.PlaceholderText, "#8a9099"), (QPalette.Link, "#1f6feb"),
+    ]:
+        pal.setColor(role, QColor(col))
+    for role in (QPalette.Text, QPalette.ButtonText, QPalette.WindowText):
+        pal.setColor(QPalette.Disabled, role, dim)
+    app.setPalette(pal)
+
+
 def main():
     # Windowed builds have no console: send stray output to a log file instead
     # of crashing (e.g. download progress bars writing to a missing stderr).
@@ -1160,6 +1194,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setStyle("Fusion")
+    apply_light_theme(app)
     app.setStyleSheet(STYLE)
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     ico = os.path.join(base, "assets", "itemfinder.ico")
