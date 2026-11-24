@@ -1,0 +1,115 @@
+# Builds the Windows installer and publishes it as a GitHub Release.
+# Every installed copy of ItemFinder checks the latest Release and updates itself.
+#
+# To publish a new version:
+#   1. Edit RELEASE_NOTES.md (shown to users in the update prompt).
+#   2. GitHub -> Actions -> "Build & release installer" -> Run workflow -> type e.g. 1.0.1
+#      (or push a git tag like v1.0.1)
+name: Build & release installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version number to release (e.g. 1.0.1) - must be higher than the last one"
+        required: true
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      HAS_SIGNING: ${{ secrets.SIGN_PFX_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Set version
+        shell: pwsh
+        run: |
+          $v = "${{ github.event.inputs.version }}"
+          if (-not $v) { $v = "${{ github.ref_name }}" }
+          $v = $v.Trim().TrimStart('v','V')
+          if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "Version must look like 1.2.3 (got '$v')" }
+          $repo = "${{ vars.RELEASE_REPO }}"
+          if (-not $repo) { $repo = "${{ github.repository }}" }
+          Set-Content -Encoding utf8 version.py "__version__ = `"$v`"`nUPDATE_REPO = `"$repo`"`n"
+          "VERSION=$v"      | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "RELEASE_REPO=$repo" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          Get-Content version.py
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch torchvision
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build app (PyInstaller)
+        run: pyinstaller --noconfirm ItemFinder.spec
+
+      - name: Self-test packaged app
+        shell: pwsh
+        run: |
+          $out = "$pwd\selftest.txt"
+          $p = Start-Process -FilePath "dist\ItemFinder\ItemFinder.exe" -ArgumentList "--selftest","`"$out`"" -Wait -PassThru
+          Get-Content $out
+          if ($p.ExitCode -ne 0) { throw "Packaged app self-test failed" }
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc "/DMyAppVersion=$env:VERSION" installer\ItemFinder.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
+          $exe = "installer\Output\ItemFinder-$env:VERSION-Setup.exe"
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  ItemFinder-$env:VERSION-Setup.exe" | Out-File -Encoding ascii "$exe.sha256"
+          Get-Item $exe | Select-Object Name, Length
+
+      # Optional code signing: add repo secrets SIGN_PFX_BASE64 + SIGN_PFX_PASSWORD
+      - name: Sign installer (optional)
+        if: env.HAS_SIGNING == 'true'
+        env:
+          SIGN_PFX_BASE64: ${{ secrets.SIGN_PFX_BASE64 }}
+          SIGN_PFX_PASSWORD: ${{ secrets.SIGN_PFX_PASSWORD }}
+        shell: pwsh
+        run: |
+          [IO.File]::WriteAllBytes("$pwd\sign.pfx", [Convert]::FromBase64String($env:SIGN_PFX_BASE64))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe | Where-Object FullName -like "*x64*" | Select-Object -First 1
+          $exe = "installer\Output\ItemFinder-$env:VERSION-Setup.exe"
+          & $signtool.FullName sign /f sign.pfx /p $env:SIGN_PFX_PASSWORD /fd sha256 /tr http://timestamp.digicert.com /td sha256 $exe
+          Remove-Item sign.pfx
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  ItemFinder-$env:VERSION-Setup.exe" | Out-File -Encoding ascii "$exe.sha256"
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          # Same repo: built-in token. Separate public releases repo: add secret RELEASE_TOKEN.
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+        run: |
+          $exe = "installer\Output\ItemFinder-$env:VERSION-Setup.exe"
+          $notes = "RELEASE_NOTES.md"
+          if (-not (Test-Path $notes)) { "ItemFinder $env:VERSION" | Out-File $notes }
+          $target = @()
+          if ($env:RELEASE_REPO -eq "${{ github.repository }}") { $target = @("--target", "${{ github.sha }}") }
+          gh release create "v$env:VERSION" $exe "$exe.sha256" --repo $env:RELEASE_REPO `
+            --title "ItemFinder $env:VERSION" --notes-file $notes --latest @target
+          if ($LASTEXITCODE -ne 0) { throw "Publishing the release failed" }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ItemFinder-installer
+          path: installer/Output/*
+          if-no-files-found: ignore
