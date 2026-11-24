@@ -1129,6 +1129,7 @@ def _selftest(out_path: str) -> int:
         with torch.no_grad():
             model.encode_image(x)
         import send2trash  # noqa: F401
+        import safetensors.torch  # noqa: F401  (model file format)
 
         lines.append(f"OK version={version.__version__} torch={torch.__version__} open_clip={open_clip.__version__}")
         code = 0

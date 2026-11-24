@@ -41,7 +41,7 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff",
 
 MODEL_NAME = "ViT-B-32"
 PRETRAINED = "laion2b_s34b_b79k"
-MODEL_FILE = "clip-vit-b-32-laion2b.bin"
+MODEL_BASENAME = "clip-vit-b-32-laion2b"  # + .safetensors or .bin (format must match extension)
 EMB_DIM = 512
 
 
@@ -87,6 +87,33 @@ def load_image(path: str, max_side: int = 448) -> Image.Image:
 
 
 # --------------------------------------------------------------------------- AI model
+def _is_safetensors(path: str) -> bool:
+    """safetensors files start with an 8-byte header length followed by '{'."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(9)
+        n = int.from_bytes(head[:8], "little")
+        return len(head) == 9 and 0 < n < 100_000_000 and head[8:9] == b"{"
+    except OSError:
+        return False
+
+
+def find_local_model() -> str | None:
+    """Return the downloaded model file, fixing a wrongly-named one from v1.0.0
+    (a .safetensors file saved as .bin, which PyTorch can't read)."""
+    d = model_dir()
+    st = os.path.join(d, MODEL_BASENAME + ".safetensors")
+    if os.path.exists(st):
+        return st
+    b = os.path.join(d, MODEL_BASENAME + ".bin")
+    if os.path.exists(b):
+        if _is_safetensors(b):
+            os.replace(b, st)
+            return st
+        return b
+    return None
+
+
 class Embedder:
     """Wraps the local CLIP model. Downloads it ONCE, then runs fully offline."""
 
@@ -100,12 +127,14 @@ class Embedder:
         if self.device == "cpu":
             torch.set_num_threads(max(1, (os.cpu_count() or 4)))
 
-        local = os.path.join(model_dir(), MODEL_FILE)
-        if not os.path.exists(local):
+        local = find_local_model()
+        if local is None:
             status("Downloading AI model (one time only, ~600 MB)...")
             cfg = open_clip.get_pretrained_cfg(MODEL_NAME, PRETRAINED)
             tmp_cache = os.path.join(model_dir(), "_download")
             src = open_clip.pretrained.download_pretrained(cfg, cache_dir=tmp_cache)
+            ext = ".safetensors" if (str(src).endswith(".safetensors") or _is_safetensors(src)) else ".bin"
+            local = os.path.join(model_dir(), MODEL_BASENAME + ext)
             shutil.copyfile(src, local + ".part")
             os.replace(local + ".part", local)
             shutil.rmtree(tmp_cache, ignore_errors=True)

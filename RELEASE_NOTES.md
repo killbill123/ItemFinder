@@ -1,6 +1,4 @@
-First release of ItemFinder.
+Fixes in 1.0.1
 
-- Find duplicate items in your photo library, even with different file names or item codes
-- Rename, move, or delete extra copies (deleted files go to the Recycle Bin)
-- Search by dropping in a photo or typing a description
-- Automatic updates
+- Fixed "Could not load the AI model" error on first run (the model you already downloaded is reused, no new 600 MB download)
+- The installer now always adds a desktop shortcut
