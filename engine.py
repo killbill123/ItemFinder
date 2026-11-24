@@ -12,6 +12,7 @@ ItemFinder engine - 100% offline visual search.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sqlite3
 import threading
@@ -169,6 +170,30 @@ class Embedder:
             e = e / e.norm(dim=-1, keepdim=True)
             e = e.mean(dim=0, keepdim=True)
             return self._norm(e)[0]
+
+
+# --------------------------------------------------------------------------- item codes
+# optional letter prefix (KEY-, SKU_, AB) + 3+ digits + optional suffix (A, -B, -XL)
+_CODE_RE = re.compile(r"(?<![A-Za-z0-9])(?:[A-Za-z]{1,8}[-_]?)?\d{3,}[A-Za-z0-9]*(?:-[A-Za-z0-9]{1,3})*(?![A-Za-z0-9])")
+LOOKS_DIFFERENT_BELOW = 0.83  # same code but pictures less similar than this = suspicious
+
+
+def item_code(path: str) -> str | None:
+    """Item code from a file name, e.g. 'KEY-0001234A Turtle Green.jpg' -> 'KEY-0001234A'.
+    Uses the first code-like word: optional letters, then 3+ digits."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    m = _CODE_RE.search(stem)
+    if m:
+        return m.group(0).upper()
+    return None
+
+
+def code_key(code: str | None) -> str | None:
+    """Comparison key: 'KEY-0001234A', 'key0001234a' and 'KEY_0001234A' all match."""
+    if not code:
+        return None
+    k = re.sub(r"[^A-Z0-9]", "", code.upper())
+    return k or None
 
 
 # --------------------------------------------------------------------------- index
@@ -333,7 +358,78 @@ class PhotoIndex:
             else:
                 self._matrix = np.zeros((0, EMB_DIM), dtype=np.float32)
             self._pos = {p: i for i, p in enumerate(self._paths)}
+            self._codes: dict[str, list[int]] = {}
+            for i, p in enumerate(self._paths):
+                k = code_key(item_code(p))
+                if k:
+                    self._codes.setdefault(k, []).append(i)
             self._loaded = True
+
+    def same_code(self, path: str) -> list[str]:
+        """Other indexed files with the same item code as `path`."""
+        k = code_key(item_code(path))
+        if not k:
+            return []
+        self._ensure_loaded()
+        me = norm_path(path)
+        return [self._paths[i] for i in self._codes.get(k, []) if norm_path(self._paths[i]) != me]
+
+    def find_code_conflicts(
+        self,
+        threshold: float | None = None,
+        progress: Callable[[int, int, str], None] | None = None,
+        cancel: threading.Event | None = None,
+    ) -> list[tuple[str, list[tuple[str, float, bool]]]]:
+        """Item codes used by photos that look like DIFFERENT items.
+        Returns [(code, [(path, similarity_to_the_others, looks_different)])]."""
+        threshold = LOOKS_DIFFERENT_BELOW if threshold is None else threshold
+        progress = progress or (lambda d, t, m: None)
+        cancel = cancel or threading.Event()
+        self._ensure_loaded()
+        groups = [idxs for idxs in self._codes.values() if len(idxs) >= 2]
+        out = []
+        for n, idxs in enumerate(groups):
+            if cancel.is_set():
+                return []
+            if n % 500 == 0:
+                progress(n, len(groups), f"Checking item codes {n:,}/{len(groups):,}...")
+            sub = self._matrix[idxs]
+            sims = sub @ sub.T
+            if sims.min() >= threshold:
+                continue  # same code, same-looking photos: fine
+            k = len(idxs)
+            # cluster the photos of this code: photos that look alike join one cluster
+            label = list(range(k))
+
+            def root(a):
+                while label[a] != a:
+                    label[a] = label[label[a]]
+                    a = label[a]
+                return a
+
+            for a in range(k):
+                for b in range(a + 1, k):
+                    if sims[a, b] >= threshold:
+                        label[root(b)] = root(a)
+            roots = [root(a) for a in range(k)]
+            sizes = {r: roots.count(r) for r in set(roots)}
+            biggest = max(sizes.values())
+            main = [r for r, n in sizes.items() if n == biggest]
+            main_root = main[0] if len(main) == 1 else None  # tie = no clear "real" item
+            ref = [a for a in range(k) if roots[a] == main_root] if main_root is not None else list(range(k))
+            flags, avg = [], []
+            for a in range(k):
+                others = [b for b in ref if b != a]
+                avg.append(float(sims[a, others].mean()) if others else 1.0)
+                flags.append(main_root is None or roots[a] != main_root)
+            members = sorted(
+                [(self._paths[i], float(a), f) for i, a, f in zip(idxs, avg, flags)],
+                key=lambda t: (t[2], -t[1]),
+            )
+            out.append((item_code(self._paths[idxs[0]]) or "", members))
+        progress(len(groups), len(groups), "")
+        out.sort(key=lambda g: (-sum(f for _, _, f in g[1]), g[0]))
+        return out
 
     def vector_for(self, path: str) -> np.ndarray | None:
         self._ensure_loaded()

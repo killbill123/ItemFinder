@@ -28,6 +28,8 @@ PATH_ROLE = Qt.UserRole
 SCORE_ROLE = Qt.UserRole + 1
 PIXELS_ROLE = Qt.UserRole + 2
 GROUP_ROLE = Qt.UserRole + 3
+FLAG_ROLE = Qt.UserRole + 4
+WARN_BG, WARN_FG, WARN_BORDER = "#ffe3c2", "#8a3d00", "#f08c00"
 
 STRICTNESS = [
     ("Exact copies only (resized / re-saved)", 0.97),
@@ -176,8 +178,25 @@ class DupWorker(QThread):
             self.failed.emit(traceback.format_exc())
 
 
+class CodeWorker(QThread):
+    progress = Signal(int, int, str)
+    done = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, index):
+        super().__init__()
+        self.index, self.cancel = index, threading.Event()
+
+    def run(self):
+        try:
+            self.progress.emit(0, 0, "Loading index...")
+            self.done.emit(self.index.find_code_conflicts(progress=self.progress.emit, cancel=self.cancel))
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
 class SearchWorker(QThread):
-    done = Signal(list, bool)
+    done = Signal(list, bool, list)  # results, text_only, same-code [(path, sim or -1)]
     failed = Signal(str)
 
     def __init__(self, index, embedder, image, image_path, text, top_k):
@@ -195,7 +214,12 @@ class SearchWorker(QThread):
             if self.text:
                 tv = self.embedder.embed_text(self.text)
             q = engine.combine(iv, tv, 0.35)
-            self.done.emit(self.index.search(q, self.top_k), iv is None)
+            same = []
+            if self.image_path:
+                for p in self.index.same_code(self.image_path):
+                    v = self.index.vector_for(p)
+                    same.append((p, float(v @ iv) if (v is not None and iv is not None) else -1.0))
+            self.done.emit(self.index.search(q, self.top_k), iv is None, same)
         except Exception:
             self.failed.emit(traceback.format_exc())
 
@@ -262,10 +286,15 @@ class PhotoGrid(QListWidget):
         self.clear()
         self.items.clear()
 
-    def add_photo(self, path: str, score_text: str = ""):
-        it = QListWidgetItem(self.placeholder, self._label(path, score_text, ""))
+    def add_photo(self, path: str, score_text: str = "", flag: str = ""):
+        """flag: warning text (e.g. 'SAME CODE') - the photo is highlighted orange."""
+        it = QListWidgetItem(self.placeholder, self._label(path, score_text, "", flag))
         it.setData(PATH_ROLE, path)
         it.setData(SCORE_ROLE, score_text)
+        it.setData(FLAG_ROLE, flag)
+        if flag:
+            it.setBackground(QColor(WARN_BG))
+            it.setForeground(QColor(WARN_FG))
         it.setData(PIXELS_ROLE, 0)
         it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
         it.setCheckState(Qt.Unchecked)
@@ -275,11 +304,12 @@ class PhotoGrid(QListWidget):
         self.thumbs.request(path, self.priority)
 
     @staticmethod
-    def _label(path, score, info):
+    def _label(path, score, info, flag=""):
         name = os.path.basename(path)
         if len(name) > 28:
             name = name[:12] + "..." + name[-13:]
-        lines = [name]
+        lines = [f"\u26a0 {flag}"] if flag else []
+        lines.append(name)
         if score:
             lines.append(score)
         if info:
@@ -291,10 +321,29 @@ class PhotoGrid(QListWidget):
         if it is None:
             return
         if not img.isNull():
-            it.setIcon(QIcon(QPixmap.fromImage(img)))
+            pm = QPixmap.fromImage(img)
+            if it.data(FLAG_ROLE):
+                pm = self._warn_frame(pm)
+            it.setIcon(QIcon(pm))
         it.setData(PIXELS_ROLE, pixels)
-        it.setText(self._label(path, it.data(SCORE_ROLE), info))
+        it.setText(self._label(path, it.data(SCORE_ROLE), info, it.data(FLAG_ROLE) or ""))
         it.setToolTip(f"{path}\n{info}")
+
+    @staticmethod
+    def _warn_frame(pm: QPixmap) -> QPixmap:
+        """Thick orange border around a thumbnail."""
+        from PySide6.QtGui import QPainter, QPen
+
+        out = QPixmap(THUMB, THUMB)
+        out.fill(Qt.transparent)
+        p = QPainter(out)
+        p.drawPixmap((THUMB - pm.width()) // 2, (THUMB - pm.height()) // 2, pm)
+        pen = QPen(QColor(WARN_BORDER))
+        pen.setWidth(8)
+        p.setPen(pen)
+        p.drawRect(4, 4, THUMB - 8, THUMB - 8)
+        p.end()
+        return out
 
     def targets(self) -> list[str]:
         checked = [it.data(PATH_ROLE) for it in self.items.values() if it.checkState() == Qt.Checked]
@@ -312,7 +361,7 @@ class PhotoGrid(QListWidget):
         it.setData(PATH_ROLE, new)
         self.items[new] = it
         self.thumbs.forget(old)
-        it.setText(self._label(new, it.data(SCORE_ROLE), ""))
+        it.setText(self._label(new, it.data(SCORE_ROLE), "", it.data(FLAG_ROLE) or ""))
         it.setToolTip(new)
         self.thumbs.request(new, self.priority)
 
@@ -454,6 +503,7 @@ class MainWindow(QMainWindow):
         self.scan_worker = self.dup_worker = self.search_worker = None
         self.upd_check = self.upd_dl = None
         self.groups: dict[int, list[str]] = {}
+        self.group_info: dict[int, dict] = {}
         self.query_image = None
         self.query_path = ""
         self.thumbs = ThumbLoader()
@@ -533,6 +583,10 @@ class MainWindow(QMainWindow):
         self.btn_dups.setObjectName("primary")
         self.btn_dups.clicked.connect(self.start_dups)
         row.addWidget(self.btn_dups)
+        self.btn_codes = QPushButton("Check item codes")
+        self.btn_codes.setToolTip("Find item codes (e.g. KEY-0001234A) used on photos of different items")
+        self.btn_codes.clicked.connect(self.start_codes)
+        row.addWidget(self.btn_codes)
         self.lbl_dups = QLabel("")
         row.addSpacing(10)
         row.addWidget(self.lbl_dups)
@@ -570,6 +624,10 @@ class MainWindow(QMainWindow):
         self.drop = DropZone()
         self.drop.dropped.connect(self._set_query)
         left.addWidget(self.drop)
+        self.lbl_qcode = QLabel("")
+        self.lbl_qcode.setObjectName("hint")
+        self.lbl_qcode.setWordWrap(True)
+        left.addWidget(self.lbl_qcode)
         r = QHBoxLayout()
         b1, b2 = QPushButton("Browse..."), QPushButton("Paste")
         b1.clicked.connect(self.browse_image)
@@ -609,6 +667,11 @@ class MainWindow(QMainWindow):
         self.search_grid = PhotoGrid(self.thumbs, priority=10)
         self.search_grid.action.connect(self.do_action)
         right.addLayout(self._action_bar(self.search_grid))
+        self.code_banner = QLabel("")
+        self.code_banner.setObjectName("warn")
+        self.code_banner.setWordWrap(True)
+        self.code_banner.setVisible(False)
+        right.addWidget(self.code_banner)
         right.addWidget(self.search_grid)
         h.addLayout(right, 1)
         return w
@@ -635,7 +698,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ state
     def _set_busy(self, busy: bool):
         ready = self.embedder is not None
-        for b in (self.btn_scan, self.btn_dups, self.btn_search, self.btn_folders):
+        for b in (self.btn_scan, self.btn_dups, self.btn_codes, self.btn_search, self.btn_folders):
             b.setEnabled(ready and not busy)
 
     def _progress(self, done, total, msg):
@@ -660,7 +723,7 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, APP_NAME, tb[-2000:])
 
     def cancel_work(self):
-        for w in (self.scan_worker, self.dup_worker):
+        for w in (self.scan_worker, self.dup_worker, getattr(self, "code_worker", None)):
             if w is not None and w.isRunning():
                 w.cancel.set()
         self.status.setText("Cancelling...")
@@ -733,6 +796,7 @@ class MainWindow(QMainWindow):
         self.group_list.clear()
         self.dup_grid.clear_photos()
         self.groups = {}
+        self.group_info = {}
         self.group_icon_items: dict[str, QListWidgetItem] = {}
         total = 0
         for gid, g in enumerate(groups):
@@ -753,13 +817,57 @@ class MainWindow(QMainWindow):
         if self.group_list.count():
             self.group_list.setCurrentRow(0)
 
+    def start_codes(self):
+        if self.index.count() == 0:
+            QMessageBox.information(self, APP_NAME, "No photos indexed yet. Add a folder first.")
+            return
+        self._set_busy(True)
+        self.btn_cancel.setVisible(True)
+        self.code_worker = CodeWorker(self.index)
+        self.code_worker.progress.connect(self._progress)
+        self.code_worker.done.connect(self._codes_done)
+        self.code_worker.failed.connect(self._error)
+        self.code_worker.start()
+
+    def _codes_done(self, conflicts):
+        """Show item codes that are used on different-looking photos."""
+        self.group_list.clear()
+        self.dup_grid.clear_photos()
+        self.groups, self.group_info = {}, {}
+        self.group_icon_items = {}
+        for gid, (code, members) in enumerate(conflicts):
+            self.groups[gid] = [p for p, _, _ in members]
+            self.group_info[gid] = {"code": code, "members": {p: (s, f) for p, s, f in members}}
+            it = QListWidgetItem(self.placeholder_icon(), "")
+            it.setData(GROUP_ROLE, gid)
+            it.setForeground(QColor(WARN_FG))
+            self.group_list.addItem(it)
+            self._label_group(it)
+            if gid < 400:
+                self.group_icon_items[members[0][0]] = it
+                self.thumbs.request(members[0][0], 0)
+        cancelled = self.code_worker.cancel.is_set()
+        n_odd = sum(f for _, m in conflicts for _, _, f in m)
+        self.lbl_dups.setText(f"\u26a0 {len(conflicts):,} item code{'s' if len(conflicts) != 1 else ''} used on "
+                              f"different-looking photos  ·  {n_odd:,} photo{'s' if n_odd != 1 else ''} to check" if conflicts else "No item code problems found.")
+        self._end_progress("Item code check cancelled." if cancelled else
+                           f"Item code check done: {len(conflicts):,} code{'s' if len(conflicts) != 1 else ''} to review.")
+        if self.group_list.count():
+            self.group_list.setCurrentRow(0)
+
     def placeholder_icon(self):
         pm = QPixmap(56, 56)
         pm.fill(QColor("#e9ecef"))
         return QIcon(pm)
 
     def _label_group(self, it: QListWidgetItem):
-        g = self.groups[it.data(GROUP_ROLE)]
+        gid = it.data(GROUP_ROLE)
+        g = self.groups[gid]
+        info = self.group_info.get(gid)
+        if info:
+            odd = sum(1 for p in g if info["members"].get(p, (0, False))[1])
+            it.setText(f"\u26a0 {info['code']}  ·  {len(g)} files\n{odd} look{'s' if odd == 1 else ''} different")
+            return
         name = os.path.basename(g[0]) if g else ""
         it.setText(f"Group {it.data(GROUP_ROLE) + 1}  ·  {len(g)} photos\n{name[:30]}")
 
@@ -772,7 +880,15 @@ class MainWindow(QMainWindow):
         self.dup_grid.clear_photos()
         if cur is None:
             return
-        g = self.groups.get(cur.data(GROUP_ROLE), [])
+        gid = cur.data(GROUP_ROLE)
+        g = self.groups.get(gid, [])
+        info = self.group_info.get(gid)
+        if info:  # item-code check group
+            for p in g:
+                s, odd = info["members"].get(p, (0.0, False))
+                self.dup_grid.add_photo(p, f"{engine.to_percent(s)}% like the others",
+                                        "LOOKS DIFFERENT" if odd else "")
+            return
         vecs = [self.index.vector_for(p) for p in g]
         ref = vecs[0] if g else None
         for p, vv in zip(g, vecs):
@@ -787,6 +903,9 @@ class MainWindow(QMainWindow):
             gid = it.data(GROUP_ROLE)
             g = [renamed.get(p, p) for p in self.groups[gid] if p not in rm]
             self.groups[gid] = g
+            info = self.group_info.get(gid)
+            if info:
+                info["members"] = {renamed.get(p, p): v for p, v in info["members"].items() if p not in rm}
             if len(g) < 2 and it is not self.group_list.currentItem():
                 self.group_list.takeItem(i)
             else:
@@ -819,6 +938,8 @@ class MainWindow(QMainWindow):
 
     def _set_query(self, im, path):
         self.query_image, self.query_path = im, path
+        code = engine.item_code(path) if path else None
+        self.lbl_qcode.setText(f"Item code: <b>{code}</b>" if code else ("No item code in file name" if path else ""))
         self.run_search()
 
     def clear_query(self):
@@ -827,6 +948,8 @@ class MainWindow(QMainWindow):
         self.drop.setText("Drag & drop a photo here\n\nor use Browse / Paste")
         self.txt.clear()
         self.search_grid.clear_photos()
+        self.code_banner.setVisible(False)
+        self.lbl_qcode.setText("")
 
     def run_search(self):
         text = self.txt.text().strip()
@@ -841,12 +964,33 @@ class MainWindow(QMainWindow):
         self.search_worker.failed.connect(self._error)
         self.search_worker.start()
 
-    def _search_done(self, results, text_only):
+    def _search_done(self, results, text_only, same):
         self.search_grid.clear_photos()
         q = engine.norm_path(self.query_path) if self.query_path else ""
+        code = engine.item_code(self.query_path) if self.query_path else None
+        shown = set()
+        # 1) files with the SAME ITEM CODE first, highlighted orange
+        n_diff = 0
+        for p, s in sorted(same, key=lambda t: t[1]):
+            different = 0 <= s < engine.LOOKS_DIFFERENT_BELOW
+            n_diff += different
+            pct = f"{engine.to_percent(s)}% match" if s >= 0 else ""
+            self.search_grid.add_photo(p, pct, "SAME CODE - LOOKS DIFFERENT" if different else "SAME CODE")
+            shown.add(engine.norm_path(p))
+        # 2) visually similar items
         for p, s in results:
+            if engine.norm_path(p) in shown:
+                continue
             tag = "  (this photo)" if q and engine.norm_path(p) == q else ""
             self.search_grid.add_photo(p, f"{engine.to_percent(s, text_only)}% match{tag}")
+        if same:
+            msg = (f"\u26a0  Item code {code} is also used by {len(same)} other file(s) - shown first, "
+                   "highlighted in orange.")
+            if n_diff:
+                msg += (f"  {n_diff} of them look{'s' if n_diff == 1 else ''} like a DIFFERENT item "
+                        "- please check.")
+            self.code_banner.setText(msg)
+        self.code_banner.setVisible(bool(same))
         self.status.setText(f"Showing {len(results)} closest items.")
 
     # ------------------------------------------------------------------ file actions
@@ -1104,6 +1248,8 @@ QPushButton#danger:hover { background: #fdecec; }
 QLabel#dropzone { border: 2px dashed #9aa4b2; border-radius: 12px; color: #5c6670; background: #f8f9fb; }
 QLabel#privacy { color: #2e7d32; font-weight: 600; }
 QLabel#hint { color: #6c757d; font-size: 9pt; }
+QLabel#warn { background: #ffe3c2; color: #8a3d00; border: 1px solid #f08c00; border-radius: 6px;
+              padding: 8px 10px; font-weight: 600; }
 QListWidget { border: 1px solid #dee2e6; border-radius: 6px; background: white; }
 QListWidget::item:selected { background: #dbe9ff; color: black; }
 """
