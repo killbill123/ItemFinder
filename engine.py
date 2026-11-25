@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import sqlite3
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -196,6 +197,57 @@ def code_key(code: str | None) -> str | None:
     return k or None
 
 
+# --------------------------------------------------------------------------- folders the app manages
+DUPLICATES_DIR = "_Duplicates"          # one-click cleanup moves extras here (next to originals)
+HOLD_DIR = ".ItemFinder-deleted"        # deleted files wait here (undo) until the app closes
+NETWORK_DELETED_DIR = "_Deleted by ItemFinder"  # network drives have no Recycle Bin
+
+
+def is_excluded_dir(name: str) -> bool:
+    return name.startswith((".", "$")) or name.lower() in (DUPLICATES_DIR.lower(), NETWORK_DELETED_DIR.lower())
+
+
+def is_network_path(path: str) -> bool:
+    """True for \\\\SERVER\\share paths and mapped network drives (e.g. Z:)."""
+    fake = os.environ.get("ITEMFINDER_TEST_NETWORK_PREFIX")  # used by tests on Linux
+    if fake and os.path.abspath(path).startswith(fake):
+        return True
+    if not sys.platform.startswith("win"):
+        return False
+    p = os.path.abspath(path)
+    if p.startswith("\\\\"):
+        return True
+    try:
+        import ctypes
+
+        return ctypes.windll.kernel32.GetDriveTypeW(os.path.splitdrive(p)[0] + "\\") == 4  # DRIVE_REMOTE
+    except Exception:
+        return False
+
+
+def is_excluded_path(path: str) -> bool:
+    parts = os.path.normpath(os.path.dirname(path)).split(os.sep)
+    return any(p and is_excluded_dir(p) for p in parts)
+
+
+def _unique_path(folder: str, name: str) -> str:
+    base, ext = os.path.splitext(name)
+    p, n = os.path.join(folder, name), 2
+    while os.path.exists(p):
+        p = os.path.join(folder, f"{base} ({n}){ext}")
+        n += 1
+    return p
+
+
+@dataclass
+class Op:
+    """One undoable file operation."""
+    kind: str               # "rename" | "move" | "delete"
+    src: str                # original path
+    dst: str                # where the file is now
+    emb: bytes | None = None  # index entry removed by the op (restored on undo)
+
+
 # --------------------------------------------------------------------------- index
 @dataclass
 class ScanResult:
@@ -204,6 +256,7 @@ class ScanResult:
     failed: int = 0
     total: int = 0
     cancelled: bool = False
+    unreachable: list = None  # folders that couldn't be reached (e.g. network drive offline)
 
 
 class PhotoIndex:
@@ -222,6 +275,9 @@ class PhotoIndex:
                     path TEXT PRIMARY KEY, mtime REAL, size INTEGER, emb BLOB);
                 CREATE TABLE IF NOT EXISTS failed(
                     path TEXT PRIMARY KEY, mtime REAL, size INTEGER, error TEXT);
+                CREATE TABLE IF NOT EXISTS ignored(a TEXT, b TEXT, PRIMARY KEY(a, b));
+                CREATE TABLE IF NOT EXISTS held(
+                    held_path TEXT PRIMARY KEY, original TEXT, emb BLOB);
                 """
             )
 
@@ -255,7 +311,7 @@ class PhotoIndex:
             for dirpath, dirnames, filenames in os.walk(root):
                 if cancel.is_set():
                     return found
-                dirnames[:] = [d for d in dirnames if not d.startswith((".", "$"))]
+                dirnames[:] = [d for d in dirnames if not is_excluded_dir(d)]
                 for f in filenames:
                     if os.path.splitext(f)[1].lower() in IMAGE_EXTS:
                         p = os.path.join(dirpath, f)
@@ -278,16 +334,25 @@ class PhotoIndex:
         res = ScanResult()
 
         progress(0, 0, "Looking for photos...")
-        on_disk = self._walk(self.folders(), cancel)
+        folders = self.folders()
+        reachable = [f for f in folders if os.path.isdir(f)]
+        res.unreachable = [f for f in folders if f not in reachable]
+        on_disk = self._walk(reachable, cancel)
         if cancel.is_set():
             res.cancelled = True
             return res
+        # never forget photos just because their (network) folder is offline right now
+        offline = [norm_path(f).rstrip("\\/") + os.sep for f in res.unreachable]
+
+        def is_offline(p: str) -> bool:
+            n = norm_path(p)
+            return any(n.startswith(o) for o in offline)
 
         with self._conn() as c:
             known = {r[0]: (r[1], r[2]) for r in c.execute("SELECT path, mtime, size FROM images")}
             bad = {r[0]: (r[1], r[2]) for r in c.execute("SELECT path, mtime, size FROM failed")}
 
-            gone = [p for p in known if p not in on_disk]
+            gone = [p for p in known if p not in on_disk and not is_offline(p)]
             c.executemany("DELETE FROM images WHERE path=?", [(p,) for p in gone])
             c.executemany("DELETE FROM failed WHERE path=?", [(p,) for p in bad if p not in on_disk])
             res.removed = len(gone)
@@ -387,6 +452,8 @@ class PhotoIndex:
         cancel = cancel or threading.Event()
         self._ensure_loaded()
         groups = [idxs for idxs in self._codes.values() if len(idxs) >= 2]
+        ignored = self.ignored_set()
+        npaths = {i: norm_path(self._paths[i]) for g in groups for i in g} if ignored else {}
         out = []
         for n, idxs in enumerate(groups):
             if cancel.is_set():
@@ -395,6 +462,11 @@ class PhotoIndex:
                 progress(n, len(groups), f"Checking item codes {n:,}/{len(groups):,}...")
             sub = self._matrix[idxs]
             sims = sub @ sub.T
+            if ignored:
+                for a in range(len(idxs)):
+                    for b in range(a + 1, len(idxs)):
+                        if frozenset((npaths[idxs[a]], npaths[idxs[b]])) in ignored:
+                            sims[a, b] = sims[b, a] = 1.0  # user said: this is fine
             if sims.min() >= threshold:
                 continue  # same code, same-looking photos: fine
             k = len(idxs)
@@ -455,6 +527,22 @@ class PhotoIndex:
         return out[:top_k]
 
 
+    # ---- "not a duplicate" memory
+    def ignore_pairs(self, pairs: Iterable[tuple[str, str]]):
+        rows = [tuple(sorted((norm_path(a), norm_path(b)))) for a, b in pairs if norm_path(a) != norm_path(b)]
+        with self._conn() as c:
+            c.executemany("INSERT OR IGNORE INTO ignored VALUES (?, ?)", rows)
+
+    def ignored_set(self) -> set[frozenset]:
+        with self._conn() as c:
+            return {frozenset(r) for r in c.execute("SELECT a, b FROM ignored")}
+
+    def clear_ignored(self) -> int:
+        with self._conn() as c:
+            n = c.execute("SELECT COUNT(*) FROM ignored").fetchone()[0]
+            c.execute("DELETE FROM ignored")
+        return n
+
     # ---- duplicates
     def find_duplicates(
         self,
@@ -496,22 +584,44 @@ class PhotoIndex:
         for i in range(n):
             groups.setdefault(find(i), []).append(i)
 
-        out = []
-        for members in groups.values():
-            if len(members) < 2:
-                continue
-            members = members[:max_group]
-            # order by similarity to the most "central" photo
+        ignored = self.ignored_set()
+        npaths = [norm_path(p) for p in paths] if ignored else []
+
+        def split_ignored(members: list[int]) -> list[list[int]]:
+            """Split a group so photos marked 'not a duplicate' never share a group."""
+            if not ignored or len(members) < 2:
+                return [members]
             sub = M[members]
-            centre = members[int(np.argmax((sub @ sub.T).sum(1)))]
-            sims = M[members] @ M[centre]
-            order = np.argsort(-sims)
-            out.append([(paths[members[k]], float(sims[k])) for k in order])
+            order = np.argsort(-(sub @ sub.T).sum(1))  # most central first
+            clusters: list[list[int]] = []
+            for k in order:
+                i = members[k]
+                for cl in clusters:
+                    if all(frozenset((npaths[i], npaths[j])) not in ignored for j in cl) and \
+                            max(float(M[i] @ M[j]) for j in cl) >= threshold:
+                        cl.append(i)
+                        break
+                else:
+                    clusters.append([i])
+            return clusters
+
+        out = []
+        for raw in groups.values():
+            for members in split_ignored(raw):
+                if len(members) < 2:
+                    continue
+                members = members[:max_group]
+                # order by similarity to the most "central" photo
+                sub = M[members]
+                centre = members[int(np.argmax((sub @ sub.T).sum(1)))]
+                sims = M[members] @ M[centre]
+                order = np.argsort(-sims)
+                out.append([(paths[members[k]], float(sims[k])) for k in order])
         out.sort(key=lambda g: (-len(g), -g[1][1]))
         return out
 
-    # ---- file actions (keep the index in sync)
-    def rename_file(self, old: str, new_name: str) -> str:
+    # ---- file actions (keep the index in sync; each returns an undoable Op)
+    def rename_file(self, old: str, new_name: str) -> Op:
         new_name = new_name.strip()
         if not new_name or any(ch in new_name for ch in '\\/:*?"<>|'):
             raise ValueError("Invalid file name")
@@ -519,33 +629,131 @@ class PhotoIndex:
             new_name += os.path.splitext(old)[1]
         new = os.path.join(os.path.dirname(old), new_name)
         if norm_path(new) == norm_path(old):
-            return old
-        if os.path.exists(new):
+            return Op("rename", old, old)
+        if os.path.exists(new) and norm_path(new) != norm_path(old):
             raise FileExistsError(f"'{new_name}' already exists in that folder")
         os.rename(old, new)
         self._repath(old, new)
-        return new
+        return Op("rename", old, new)
 
-    def move_file(self, old: str, dest_dir: str) -> str:
+    def move_file(self, old: str, dest_dir: str) -> Op:
         os.makedirs(dest_dir, exist_ok=True)
-        base, ext = os.path.splitext(os.path.basename(old))
-        new = os.path.join(dest_dir, base + ext)
-        n = 2
-        while os.path.exists(new):
-            new = os.path.join(dest_dir, f"{base} ({n}){ext}")
-            n += 1
+        new = _unique_path(dest_dir, os.path.basename(old))
+        emb = self._take_row(old) if is_excluded_path(new) else None
         shutil.move(old, new)
-        self._repath(old, new)
-        return new
+        if emb is None:
+            self._repath(old, new)
+        return Op("move", old, new, emb)
 
-    def delete_file(self, path: str):
-        """Send to the Recycle Bin (recoverable), never a permanent delete."""
+    def move_to_duplicates(self, path: str) -> Op:
+        """One-click cleanup: move into a _Duplicates folder beside the original."""
+        return self.move_file(path, os.path.join(os.path.dirname(path), DUPLICATES_DIR))
+
+    def delete_file(self, path: str) -> Op:
+        """Hold the file in a hidden folder (so Undo works); flush_deleted()
+        sends held files to the Recycle Bin when the app closes."""
+        emb = self._take_row(path)
+        if not os.path.exists(path):
+            return Op("delete", path, "", emb)
+        hold = os.path.join(os.path.dirname(path), HOLD_DIR)
+        os.makedirs(hold, exist_ok=True)
+        if sys.platform.startswith("win"):
+            try:  # hide the holding folder in Explorer
+                import ctypes
+
+                ctypes.windll.kernel32.SetFileAttributesW(hold, 0x02)
+            except Exception:
+                pass
+        dst = _unique_path(hold, os.path.basename(path))
+        os.replace(path, dst)
+        with self._conn() as c:
+            c.execute("INSERT OR REPLACE INTO held VALUES (?,?,?)", (dst, path, emb))
+        return Op("delete", path, dst, emb)
+
+    def undo(self, op: Op):
+        """Reverse one operation. Raises if the original location is taken."""
+        if op.kind == "rename" and op.src == op.dst:
+            return
+        if not op.dst:  # file was already gone; just restore the index entry
+            self._put_row(op.src, op.emb)
+            return
+        if os.path.exists(op.src):
+            raise FileExistsError(f"Can't undo: '{os.path.basename(op.src)}' already exists again")
+        if not os.path.exists(op.dst):
+            raise FileNotFoundError(f"Can't undo: '{os.path.basename(op.dst)}' was moved or deleted")
+        os.makedirs(os.path.dirname(op.src), exist_ok=True)
+        shutil.move(op.dst, op.src)
+        if op.kind == "delete":
+            with self._conn() as c:
+                c.execute("DELETE FROM held WHERE held_path=?", (op.dst,))
+        if op.emb is not None:
+            self._put_row(op.src, op.emb)
+        else:
+            self._repath(op.dst, op.src)
+        _remove_if_empty(os.path.dirname(op.dst))
+
+    def flush_deleted(self) -> int:
+        """Send held (deleted) files to the Recycle Bin. Network drives have no
+        Recycle Bin (Windows would delete for good), so those files go to a
+        '_Deleted by ItemFinder' folder at the top of their photo folder."""
         from send2trash import send2trash
 
-        if os.path.exists(path):
-            send2trash(path)
         with self._conn() as c:
+            rows = c.execute("SELECT held_path, original FROM held").fetchall()
+        n = 0
+        for p, original in rows:
+            try:
+                if os.path.exists(p):
+                    if is_network_path(p):
+                        dest = os.path.join(self._root_of(original or p), NETWORK_DELETED_DIR)
+                        os.makedirs(dest, exist_ok=True)
+                        shutil.move(p, _unique_path(dest, os.path.basename(p)))
+                    else:
+                        send2trash(p)
+                    n += 1
+                with self._conn() as c:
+                    c.execute("DELETE FROM held WHERE held_path=?", (p,))
+                _remove_if_empty(os.path.dirname(p))
+            except Exception:
+                pass
+        return n
+
+    def _root_of(self, path: str) -> str:
+        """The indexed photo folder that contains `path` (or its folder)."""
+        n = norm_path(path)
+        best = ""
+        for f in self.folders():
+            nf = norm_path(f).rstrip("\\/") + os.sep
+            if n.startswith(nf) and len(nf) > len(best):
+                best = f
+        return best or os.path.dirname(os.path.dirname(path))
+
+    def held_has_network(self) -> bool:
+        with self._conn() as c:
+            return any(is_network_path(r[0]) for r in c.execute("SELECT held_path FROM held"))
+
+    def held_count(self) -> int:
+        with self._conn() as c:
+            return c.execute("SELECT COUNT(*) FROM held").fetchone()[0]
+
+    # ---- row helpers
+    def _take_row(self, path: str) -> bytes | None:
+        with self._conn() as c:
+            r = c.execute("SELECT emb FROM images WHERE path=?", (path,)).fetchone()
             c.execute("DELETE FROM images WHERE path=?", (path,))
+        self.invalidate()
+        return r[0] if r else None
+
+    def _put_row(self, path: str, emb: bytes | None):
+        if emb is None or is_excluded_path(path):
+            return
+        try:
+            st = os.stat(path)
+            sig = (st.st_mtime, st.st_size)
+        except OSError:
+            return
+        with self._conn() as c:
+            c.execute("INSERT OR REPLACE INTO images VALUES (?,?,?,?)", (path, *sig, emb))
         self.invalidate()
 
     def _repath(self, old: str, new: str):
@@ -554,9 +762,20 @@ class PhotoIndex:
             sig = (st.st_mtime, st.st_size)
         except OSError:
             sig = (0, 0)
+        o, n = norm_path(old), norm_path(new)
         with self._conn() as c:
             c.execute("UPDATE OR REPLACE images SET path=?, mtime=?, size=? WHERE path=?", (new, *sig, old))
+            c.execute("UPDATE OR IGNORE ignored SET a=? WHERE a=?", (n, o))
+            c.execute("UPDATE OR IGNORE ignored SET b=? WHERE b=?", (n, o))
         self.invalidate()
+
+
+def _remove_if_empty(folder: str):
+    try:
+        if os.path.basename(folder) in (HOLD_DIR, DUPLICATES_DIR) and not os.listdir(folder):
+            os.rmdir(folder)
+    except OSError:
+        pass
 
 
 def combine(img_vec: np.ndarray | None, txt_vec: np.ndarray | None, text_weight: float = 0.5) -> np.ndarray:

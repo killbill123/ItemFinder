@@ -44,20 +44,19 @@ If a build breaks the app, the workflow's self-test step fails and **nothing is 
 
 ## Using it
 
+- **Search by photo** (first tab): drop a photo anywhere on the window, click Browse, or press Ctrl+V. Files with the same item code are shown first, highlighted in orange; if one looks like a different item it says **LOOKS DIFFERENT**.
 - **Find duplicates:**
-  1. Pick a match level and click **Find duplicates**.
-  2. Click a group on the left to see its photos.
-  3. Click **Tick all but best copy**. This keeps the highest-resolution photo and ticks the rest.
-  4. Click **Delete** (sends them to the Recycle Bin), **Move to…** or **Rename…**.
-- **Renaming several photos at once:** tick several photos and click **Rename…**. They get numbered names, for example `BLUE-TURTLE_01.jpg`, `BLUE-TURTLE_02.jpg`.
-- **Search by photo:**
-  - Drag a photo onto the window, click **Browse**, or press Ctrl+V to paste a copied image.
-  - You can add words to steer the search, for example "blue".
-- **Shortcuts:**
-  - Del: delete
-  - F2: rename
-  - Enter: open
-  - Right-click: show in folder, or find items like this one
+  1. Pick a match level and click **Find duplicates**, then click a group.
+  2. **Tick all but best copy**, then Delete / Move to... / Rename..., or
+  3. **Clean up all groups...** keeps the best copy in every group and moves the extras into a `_Duplicates` folder next to them (nothing is deleted).
+  4. **Compare** opens two photos side by side with resolution, size and date; green ✔ marks the better copy.
+  5. **Not duplicates** remembers that the ticked photos are different items, so they're never grouped again.
+- **Check item codes:** finds item codes used on photos of different items. **Code is OK** remembers codes that are correct.
+- **Item list check:** load a CSV or Excel export of your item list to see codes with no photo, and photos whose code isn't on the list.
+- **Export to Excel:** on the duplicates and item-list screens. Reports include clickable file links.
+- **Undo** (Ctrl+Z): reverses renames, moves, deletes and cleanups made since you opened ItemFinder. Deleted photos go to the Recycle Bin when you close the app.
+- **Network drives:** in Photo folders..., use **Add network folder...** for `\\SERVER\Photos` paths (mapped drives like `Z:` also work with Add folder). Network drives have no Recycle Bin, so deleted photos there go to a `_Deleted by ItemFinder` folder at the top of that photo folder. If a network folder is offline, it's skipped and its photos stay in the index.
+- **Shortcuts:** Del delete · F2 rename · Enter open · Ctrl+Z undo · right-click for more.
 
 ## Good to know
 

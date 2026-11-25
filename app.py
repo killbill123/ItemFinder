@@ -18,7 +18,9 @@ from PySide6.QtWidgets import (
     QPushButton, QSpinBox, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 
+import compare
 import engine
+import reports
 import updater
 import version
 
@@ -174,6 +176,23 @@ class DupWorker(QThread):
         try:
             self.progress.emit(0, 0, "Loading index...")
             self.done.emit(self.index.find_duplicates(self.threshold, self.progress.emit, self.cancel))
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
+class FuncWorker(QThread):
+    """Run fn(progress, cancel) in the background."""
+    progress = Signal(int, int, str)
+    done = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, fn):
+        super().__init__()
+        self.fn, self.cancel = fn, threading.Event()
+
+    def run(self):
+        try:
+            self.done.emit(self.fn(self.progress.emit, self.cancel))
         except Exception:
             self.failed.emit(traceback.format_exc())
 
@@ -377,6 +396,7 @@ class PhotoGrid(QListWidget):
             ("Open", "open"), ("Show in folder", "show"), (None, None),
             ("Rename...  (F2)", "rename"), ("Move to folder...", "move"),
             ("Delete to Recycle Bin  (Del)", "delete"), (None, None),
+            ("Compare side by side", "compare"),
             ("Find items like this", "similar"), ("Copy file path", "copy"),
         ]:
             if label is None:
@@ -462,10 +482,14 @@ class FoldersDialog(QDialog):
         lay.addWidget(self.list)
         row = QHBoxLayout()
         add, rem, close = QPushButton("Add folder..."), QPushButton("Remove"), QPushButton("Done")
+        net = QPushButton("Add network folder...")
+        net.setToolTip("Type a network path like \\\\SERVER\\Photos (mapped drives like Z: work with Add folder too)")
+        net.clicked.connect(self._add_network)
         add.clicked.connect(self._add)
         rem.clicked.connect(self._remove)
         close.clicked.connect(self.accept)
         row.addWidget(add)
+        row.addWidget(net)
         row.addWidget(rem)
         row.addStretch()
         row.addWidget(close)
@@ -474,7 +498,34 @@ class FoldersDialog(QDialog):
 
     def _refresh(self):
         self.list.clear()
-        self.list.addItems(self.index.folders())
+        for f in self.index.folders():
+            tags = []
+            if engine.is_network_path(f):
+                tags.append("network")
+            if not os.path.isdir(f):
+                tags.append("NOT REACHABLE")
+            it = QListWidgetItem(f + (f"   ({', '.join(tags)})" if tags else ""))
+            it.setData(Qt.UserRole, f)
+            if not os.path.isdir(f):
+                it.setForeground(QColor("#c62828"))
+            self.list.addItem(it)
+
+    def _add_network(self):
+        path, ok = QInputDialog.getText(
+            self, "Add network folder",
+            "Network folder path, for example:\n\\\\SERVER\\Photos\\Items     or     Z:\\Photos", text="\\\\")
+        path = path.strip().strip('"')
+        if not ok or not path or path == "\\\\":
+            return
+        if not os.path.isdir(path):
+            QMessageBox.warning(self, "Add network folder",
+                                f"Can't open:\n{path}\n\nCheck the path, that the server is on, and that you're "
+                                "connected to the network (or VPN). Opening it once in File Explorer can help "
+                                "Windows remember the login.")
+            return
+        self.index.add_folder(path)
+        self.changed = True
+        self._refresh()
 
     def _add(self):
         d = QFileDialog.getExistingDirectory(self, "Choose your photo folder")
@@ -486,7 +537,7 @@ class FoldersDialog(QDialog):
     def _remove(self):
         it = self.list.currentItem()
         if it:
-            self.index.remove_folder(it.text())
+            self.index.remove_folder(it.data(Qt.UserRole) or it.text())
             self.changed = True
             self._refresh()
 
@@ -504,6 +555,13 @@ class MainWindow(QMainWindow):
         self.upd_check = self.upd_dl = None
         self.groups: dict[int, list[str]] = {}
         self.group_info: dict[int, dict] = {}
+        self.group_of: dict[str, int] = {}   # path -> group it was removed from (for undo)
+        self.undo_stack: list[tuple[str, list]] = []
+        self.list_data = None
+        try:
+            self.index.flush_deleted()  # leftovers from a previous session -> Recycle Bin
+        except Exception:
+            pass
         self.query_image = None
         self.query_path = ""
         self.thumbs = ThumbLoader()
@@ -520,6 +578,16 @@ class MainWindow(QMainWindow):
         top.addWidget(self.btn_scan)
         top.addSpacing(12)
         top.addWidget(self.lbl_count)
+        top.addSpacing(12)
+        self.btn_undo = QPushButton("\u21b6 Undo")
+        self.btn_undo.setEnabled(False)
+        self.btn_undo.setToolTip("Nothing to undo")
+        self.btn_undo.clicked.connect(self.undo_last)
+        top.addWidget(self.btn_undo)
+        top.addSpacing(12)
+        tip = QLabel("Tip: drop a photo anywhere on this window to search for it")
+        tip.setObjectName("hint")
+        top.addWidget(tip)
         top.addStretch()
         privacy = QLabel("Offline  ·  photos never leave this PC")
         privacy.setObjectName("privacy")
@@ -533,8 +601,12 @@ class MainWindow(QMainWindow):
         top.addWidget(self.btn_update)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_dup_tab(), "Find duplicates")
-        self.tabs.addTab(self._build_search_tab(), "Search by photo")
+        self.search_page = self._build_search_tab()
+        self.dup_page = self._build_dup_tab()
+        self.list_page = self._build_list_tab()
+        self.tabs.addTab(self.search_page, "Search by photo")
+        self.tabs.addTab(self.dup_page, "Find duplicates")
+        self.tabs.addTab(self.list_page, "Item list check")
 
         central = QWidget()
         v = QVBoxLayout(central)
@@ -556,6 +628,7 @@ class MainWindow(QMainWindow):
         sb.addPermanentWidget(self.btn_cancel)
 
         QShortcut(QKeySequence.Paste, self, activated=self.paste_image)
+        QShortcut(QKeySequence.Undo, self, activated=self.undo_last)
         self._update_count()
         self._set_busy(True)
 
@@ -587,6 +660,14 @@ class MainWindow(QMainWindow):
         self.btn_codes.setToolTip("Find item codes (e.g. KEY-0001234A) used on photos of different items")
         self.btn_codes.clicked.connect(self.start_codes)
         row.addWidget(self.btn_codes)
+        row.addSpacing(16)
+        self.btn_cleanup = QPushButton("Clean up all groups...")
+        self.btn_cleanup.setToolTip("Keep the best copy in every group and move the extras into _Duplicates folders")
+        self.btn_cleanup.clicked.connect(self.cleanup_all)
+        row.addWidget(self.btn_cleanup)
+        self.btn_export = QPushButton("Export to Excel...")
+        self.btn_export.clicked.connect(self.export_groups)
+        row.addWidget(self.btn_export)
         self.lbl_dups = QLabel("")
         row.addSpacing(10)
         row.addWidget(self.lbl_dups)
@@ -676,13 +757,147 @@ class MainWindow(QMainWindow):
         h.addLayout(right, 1)
         return w
 
+    def _build_list_tab(self) -> QWidget:
+        w = QWidget()
+        v = QVBoxLayout(w)
+        row = QHBoxLayout()
+        self.btn_load_list = QPushButton("Load item list (CSV / Excel)...")
+        self.btn_load_list.setObjectName("primary")
+        self.btn_load_list.clicked.connect(self.load_item_list)
+        row.addWidget(self.btn_load_list)
+        row.addWidget(QLabel("Code column:"))
+        self.cmb_code_col = QComboBox()
+        self.cmb_code_col.setMinimumWidth(160)
+        self.cmb_code_col.currentIndexChanged.connect(lambda _: self.run_list_check())
+        row.addWidget(self.cmb_code_col)
+        self.btn_recheck = QPushButton("Re-check")
+        self.btn_recheck.clicked.connect(self.run_list_check)
+        row.addWidget(self.btn_recheck)
+        self.btn_export_list = QPushButton("Export to Excel...")
+        self.btn_export_list.clicked.connect(self.export_list)
+        row.addWidget(self.btn_export_list)
+        row.addStretch()
+        v.addLayout(row)
+        self.lbl_list = QLabel("Load an export of your item list (from your inventory or POS system) to find "
+                               "items with no photo, and photos whose item code isn't on the list.")
+        self.lbl_list.setWordWrap(True)
+        v.addWidget(self.lbl_list)
+
+        split = QSplitter()
+        left = QWidget()
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 0, 0)
+        self.lbl_nophoto = QLabel("<b>On the list, but no photo</b>")
+        lv.addWidget(self.lbl_nophoto)
+        self.list_nophoto = QListWidget()
+        self.list_nophoto.setMinimumWidth(260)
+        lv.addWidget(self.list_nophoto)
+        split.addWidget(left)
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        self.lbl_notinlist = QLabel("<b>Photos whose item code is not on the list</b>  (typos or discontinued items)")
+        rv.addWidget(self.lbl_notinlist)
+        self.list_grid = PhotoGrid(self.thumbs, priority=10)
+        self.list_grid.action.connect(self.do_action)
+        rv.addLayout(self._action_bar(self.list_grid))
+        rv.addWidget(self.list_grid)
+        split.addWidget(right)
+        split.setStretchFactor(1, 1)
+        split.setSizes([300, 900])
+        v.addWidget(split, 1)
+        for b in (self.btn_recheck, self.btn_export_list):
+            b.setEnabled(False)
+        self.cmb_code_col.setEnabled(False)
+        return w
+
+    def load_item_list(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open item list", "",
+                                              "Item lists (*.csv *.xlsx *.xlsm *.txt);;All files (*)")
+        if not path:
+            return
+        try:
+            headers, rows = reports.read_table(path)
+        except Exception as e:
+            QMessageBox.warning(self, APP_NAME, f"Could not read the item list:\n{e}")
+            return
+        code_col, desc_col = reports.guess_columns(headers, rows)
+        self.list_data = {"path": path, "headers": headers, "rows": rows, "desc": desc_col}
+        self.cmb_code_col.blockSignals(True)
+        self.cmb_code_col.clear()
+        self.cmb_code_col.addItems(headers)
+        self.cmb_code_col.setCurrentIndex(code_col)
+        self.cmb_code_col.blockSignals(False)
+        for wdg in (self.cmb_code_col, self.btn_recheck, self.btn_export_list):
+            wdg.setEnabled(True)
+        self.run_list_check()
+
+    def run_list_check(self):
+        if not self.list_data:
+            return
+        d = self.list_data
+        code_col = max(0, self.cmb_code_col.currentIndex())
+        desc = d["desc"] if d["desc"] != code_col else None
+        self.index._ensure_loaded()
+        res = reports.check_list(d["rows"], code_col, list(self.index._paths))
+        d["result"], d["code_col"], d["desc_col"] = res, code_col, desc
+        self.list_nophoto.clear()
+        for r in res.no_photo:
+            text = r[code_col] + (f"  -  {r[desc]}" if desc is not None and r[desc] else "")
+            self.list_nophoto.addItem(text)
+        self.list_grid.clear_photos()
+        for p in res.not_in_list:
+            self.list_grid.add_photo(p, "", "NOT IN LIST")
+        self.lbl_nophoto.setText(f"<b>On the list, but no photo ({len(res.no_photo):,})</b>")
+        self.lbl_notinlist.setText(f"<b>Photos whose item code is not on the list ({len(res.not_in_list):,})</b>"
+                                   "  - typos or discontinued items")
+        extra = (f"  ·  {res.photos_without_code:,} photos have no item code in their name"
+                 if res.photos_without_code else "")
+        self.lbl_list.setText(
+            f"<b>{os.path.basename(d['path'])}</b>: {res.list_codes:,} item codes on the list  ·  "
+            f"{res.matched_codes:,} have photos  ·  <span style='color:#8a3d00'>{len(res.no_photo):,} without "
+            f"photo  ·  {len(res.not_in_list):,} photos not on the list</span>{extra}")
+
+    def export_list(self):
+        d = self.list_data
+        if not d or "result" not in d:
+            return
+        name = reports.default_report_name("item list check")
+        path, _ = QFileDialog.getSaveFileName(self, "Export to Excel", os.path.join(os.path.expanduser("~"),
+                                              "Desktop", name), "Excel (*.xlsx)")
+        if not path:
+            return
+        res, headers = d["result"], d["headers"]
+
+        def work(progress, cancel):
+            summary = [["Item list", d["path"]], ["Item codes on the list", res.list_codes],
+                       ["Codes with photos", res.matched_codes], ["On the list, no photo", len(res.no_photo)],
+                       ["Photos not on the list", len(res.not_in_list)],
+                       ["Photos without an item code", res.photos_without_code]]
+            no_photo = [["No photo"] + r for r in res.no_photo]
+            not_in = []
+            for p in res.not_in_list:
+                det = compare.photo_details(p)
+                not_in.append(["Not in list", det["code"], det["name"], det["folder"], det["modified"], p])
+            reports.write_excel(path, [
+                ("Summary", ["What", "Count"], summary),
+                ("No photo", ["Status"] + headers, no_photo),
+                ("Not on list", ["Status", "Item code", "File name", "Folder", "Modified", "Full path"], not_in),
+            ])
+            return path
+
+        self._run_export(work)
+
     def _action_bar(self, grid: PhotoGrid, keep_best=False) -> QHBoxLayout:
         row = QHBoxLayout()
         buttons = []
         if keep_best:
             buttons.append(("Tick all but best copy", "keepbest"))
         buttons += [("Tick all", "tickall"), ("Untick all", "untick"), (None, None),
-                    ("Rename...", "rename"), ("Move to...", "move"), ("Delete", "delete")]
+                    ("Compare", "compare")]
+        if keep_best:
+            buttons.append(("Not duplicates", "notdup"))
+        buttons += [(None, None), ("Rename...", "rename"), ("Move to...", "move"), ("Delete", "delete")]
         for label, name in buttons:
             if label is None:
                 row.addSpacing(16)
@@ -690,6 +905,12 @@ class MainWindow(QMainWindow):
             b = QPushButton(label)
             if name == "delete":
                 b.setObjectName("danger")
+            if name == "notdup":
+                self.btn_notdup = b
+                b.setToolTip("Tell ItemFinder the ticked photos are NOT duplicates of the others - "
+                             "they won't be grouped together again")
+            if name == "compare":
+                b.setToolTip("Compare two photos side by side")
             b.clicked.connect(lambda _=False, n=name: self.do_action(n, grid))
             row.addWidget(b)
         row.addStretch()
@@ -698,8 +919,12 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ state
     def _set_busy(self, busy: bool):
         ready = self.embedder is not None
-        for b in (self.btn_scan, self.btn_dups, self.btn_codes, self.btn_search, self.btn_folders):
+        for b in (self.btn_scan, self.btn_dups, self.btn_codes, self.btn_search, self.btn_folders,
+                  self.btn_load_list):
             b.setEnabled(ready and not busy)
+        has_groups = bool(self.groups) and not busy
+        self.btn_export.setEnabled(has_groups)
+        self.btn_cleanup.setEnabled(has_groups and not self.group_info)
 
     def _progress(self, done, total, msg):
         self.status.setText(msg)
@@ -723,7 +948,8 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, APP_NAME, tb[-2000:])
 
     def cancel_work(self):
-        for w in (self.scan_worker, self.dup_worker, getattr(self, "code_worker", None)):
+        for w in (self.scan_worker, self.dup_worker, getattr(self, "code_worker", None),
+                  getattr(self, "cleanup_worker", None), getattr(self, "export_worker", None)):
             if w is not None and w.isRunning():
                 w.cancel.set()
         self.status.setText("Cancelling...")
@@ -777,7 +1003,17 @@ class MainWindow(QMainWindow):
         if r.failed:
             parts.append(f"{r.failed:,} unreadable")
         msg = ("Indexing paused - click Update index to resume. " if r.cancelled else "Index up to date. ")
+        if r.unreachable:
+            parts.append(f"{len(r.unreachable)} folder(s) not reachable - skipped, their photos are kept")
         self._end_progress(msg + ", ".join(parts) + ".")
+        if r.unreachable and not getattr(self, "_warned_unreachable", False):
+            self._warned_unreachable = True
+            QMessageBox.warning(
+                self, APP_NAME,
+                "These photo folders couldn't be reached, so they were skipped:\n\n"
+                + "\n".join("  \u2022 " + f for f in r.unreachable)
+                + "\n\nIf it's a network drive, check the server and your network/VPN connection, then "
+                  "click Update index. Their photos stay in the index in the meantime.")
 
     # ------------------------------------------------------------------ duplicates
     def start_dups(self):
@@ -797,6 +1033,7 @@ class MainWindow(QMainWindow):
         self.dup_grid.clear_photos()
         self.groups = {}
         self.group_info = {}
+        self.group_of = {}
         self.group_icon_items: dict[str, QListWidgetItem] = {}
         total = 0
         for gid, g in enumerate(groups):
@@ -834,6 +1071,7 @@ class MainWindow(QMainWindow):
         self.group_list.clear()
         self.dup_grid.clear_photos()
         self.groups, self.group_info = {}, {}
+        self.group_of = {}
         self.group_icon_items = {}
         for gid, (code, members) in enumerate(conflicts):
             self.groups[gid] = [p for p, _, _ in members]
@@ -864,12 +1102,25 @@ class MainWindow(QMainWindow):
         gid = it.data(GROUP_ROLE)
         g = self.groups[gid]
         info = self.group_info.get(gid)
+        if info and info.get("ok"):
+            it.setText(f"\u2714 {info['code']}  ·  marked OK")
+            it.setForeground(QColor("#2e7d32"))
+            return
         if info:
             odd = sum(1 for p in g if info["members"].get(p, (0, False))[1])
+            if odd == 0:
+                it.setText(f"\u2714 {info['code']}  ·  resolved")
+                it.setForeground(QColor("#2e7d32"))
+                return
             it.setText(f"\u26a0 {info['code']}  ·  {len(g)} files\n{odd} look{'s' if odd == 1 else ''} different")
             return
         name = os.path.basename(g[0]) if g else ""
-        it.setText(f"Group {it.data(GROUP_ROLE) + 1}  ·  {len(g)} photos\n{name[:30]}")
+        if len(g) < 2:
+            it.setText(f"\u2714 Group {gid + 1}  ·  resolved\n{name[:30]}")
+            it.setForeground(QColor("#2e7d32"))
+            return
+        it.setForeground(QColor("#1f2328"))
+        it.setText(f"Group {gid + 1}  ·  {len(g)} photos\n{name[:30]}")
 
     def _group_icon_ready(self, path, img, info, pixels):
         it = getattr(self, "group_icon_items", {}).get(path)
@@ -883,6 +1134,8 @@ class MainWindow(QMainWindow):
         gid = cur.data(GROUP_ROLE)
         g = self.groups.get(gid, [])
         info = self.group_info.get(gid)
+        if hasattr(self, "btn_notdup"):
+            self.btn_notdup.setText("Code is OK" if info else "Not duplicates")
         if info:  # item-code check group
             for p in g:
                 s, odd = info["members"].get(p, (0.0, False))
@@ -898,18 +1151,19 @@ class MainWindow(QMainWindow):
     def _sync_groups_after(self, removed: list[str], renamed: dict[str, str]):
         """Keep the duplicate-group list in step with file operations."""
         rm = set(removed)
+        self._group_before = {gid: set(g) for gid, g in self.groups.items()}
         for i in range(self.group_list.count() - 1, -1, -1):
             it = self.group_list.item(i)
             gid = it.data(GROUP_ROLE)
             g = [renamed.get(p, p) for p in self.groups[gid] if p not in rm]
             self.groups[gid] = g
             info = self.group_info.get(gid)
-            if info:
-                info["members"] = {renamed.get(p, p): v for p, v in info["members"].items() if p not in rm}
-            if len(g) < 2 and it is not self.group_list.currentItem():
-                self.group_list.takeItem(i)
-            else:
-                self._label_group(it)
+            if info:  # keep removed members' scores so Undo can restore them
+                info["members"] = {renamed.get(p, p): v for p, v in info["members"].items()}
+            for p in rm:
+                if p in self._group_before.get(gid, ()):
+                    self.group_of[p] = gid
+            self._label_group(it)
 
     # ------------------------------------------------------------------ search
     def browse_image(self):
@@ -922,10 +1176,10 @@ class MainWindow(QMainWindow):
         cb = QApplication.clipboard()
         md = cb.mimeData()
         if md.hasImage():
-            self.tabs.setCurrentIndex(1)
+            self.tabs.setCurrentWidget(self.search_page)
             self.drop.load_qimage(cb.image())
         elif md.hasUrls() and md.urls()[0].toLocalFile():
-            self.tabs.setCurrentIndex(1)
+            self.tabs.setCurrentWidget(self.search_page)
             self.drop.load_path(md.urls()[0].toLocalFile())
 
     def dragEnterEvent(self, e):
@@ -933,7 +1187,7 @@ class MainWindow(QMainWindow):
             e.acceptProposedAction()
 
     def dropEvent(self, e):
-        self.tabs.setCurrentIndex(1)
+        self.tabs.setCurrentWidget(self.search_page)
         self.drop.dropEvent(e)
 
     def _set_query(self, im, path):
@@ -1007,7 +1261,9 @@ class MainWindow(QMainWindow):
             self._tick_all_but_best(grid)
             return
         paths = grid.targets()
-        if not paths:
+        if name == "notdup" and not paths and self.group_info.get(self._current_gid()):
+            paths = []  # "Code is OK" with nothing ticked = whole group
+        elif not paths:
             QMessageBox.information(self, APP_NAME, "Tick or select at least one photo first.")
             return
         if name == "open":
@@ -1019,8 +1275,12 @@ class MainWindow(QMainWindow):
             QApplication.clipboard().setText("\n".join(paths))
             self.status.setText("Path copied.")
         elif name == "similar":
-            self.tabs.setCurrentIndex(1)
+            self.tabs.setCurrentWidget(self.search_page)
             self.drop.load_path(paths[0])
+        elif name == "compare":
+            self._compare(grid, paths)
+        elif name == "notdup":
+            self._not_duplicates(paths)
         elif name == "rename":
             self._rename(paths)
         elif name == "move":
@@ -1047,8 +1307,68 @@ class MainWindow(QMainWindow):
             it.setCheckState(Qt.Unchecked if p == best else Qt.Checked)
         self.status.setText(f"Keeping: {os.path.basename(best)}  -  {len(paths) - 1} extra copies ticked.")
 
+    def _apply_ops(self, ops: list, label: str):
+        """Update all views after file operations and remember them for Undo."""
+        removed, renamed = [], {}
+        for op in ops:
+            if op.kind == "delete" or op.emb is not None:
+                removed.append(op.src)
+            elif op.dst != op.src:
+                renamed[op.src] = op.dst
+        self._apply_everywhere(removed, renamed)
+        if ops:
+            self.undo_stack.append((label, ops))
+            self.undo_stack = self.undo_stack[-50:]
+        self._refresh_undo()
+
+    def _refresh_undo(self):
+        if self.undo_stack:
+            self.btn_undo.setEnabled(True)
+            self.btn_undo.setToolTip(f"Undo: {self.undo_stack[-1][0]}  (Ctrl+Z)")
+        else:
+            self.btn_undo.setEnabled(False)
+            self.btn_undo.setToolTip("Nothing to undo")
+
+    def undo_last(self):
+        if not self.undo_stack:
+            return
+        label, ops = self.undo_stack.pop()
+        errors, restored = [], []
+        for op in reversed(ops):
+            try:
+                self.index.undo(op)
+                restored.append(op)
+            except Exception as e:
+                errors.append(str(e))
+        for op in restored:
+            gone = op.kind == "delete" or op.emb is not None
+            if gone:
+                gid = self.group_of.pop(op.src, None)
+                if gid is not None and op.src not in self.groups.get(gid, []):
+                    self.groups[gid].append(op.src)
+                self.search_grid.add_photo(op.src, "restored")
+            else:
+                for g in (self.dup_grid, self.search_grid, self.list_grid):
+                    g.rename_path(op.dst, op.src)
+                for gid, g in self.groups.items():
+                    self.groups[gid] = [op.src if p == op.dst else p for p in g]
+                    info = self.group_info.get(gid)
+                    if info and op.dst in info["members"]:
+                        info["members"][op.src] = info["members"].pop(op.dst)
+        for i in range(self.group_list.count()):
+            self._label_group(self.group_list.item(i))
+        if self.group_list.currentItem() is not None:
+            self._show_group(self.group_list.currentItem())
+        self._update_count()
+        self._refresh_undo()
+        self._report(f"Undone: {label}.", errors)
+
+    def _current_gid(self):
+        it = self.group_list.currentItem()
+        return it.data(GROUP_ROLE) if it is not None else None
+
     def _apply_everywhere(self, removed: list[str], renamed: dict[str, str]):
-        for g in (self.dup_grid, self.search_grid):
+        for g in (self.dup_grid, self.search_grid, self.list_grid):
             for p in removed:
                 g.remove_path(p)
             for o, n in renamed.items():
@@ -1057,14 +1377,14 @@ class MainWindow(QMainWindow):
         self._update_count()
 
     def _rename(self, paths: list[str]):
-        renamed, errors = {}, []
+        ops, errors = [], []
         if len(paths) == 1:
             old = paths[0]
             new, ok = QInputDialog.getText(self, "Rename", "New file name:", text=os.path.basename(old))
             if not ok or not new.strip():
                 return
             try:
-                renamed[old] = self.index.rename_file(old, new)
+                ops.append(self.index.rename_file(old, new))
             except Exception as e:
                 errors.append(f"{os.path.basename(old)}: {e}")
         else:
@@ -1088,43 +1408,215 @@ class MainWindow(QMainWindow):
                         break
                     suffix = f"-{len(suffix) + 1}" if suffix else "-b"
                 try:
-                    renamed[old] = self.index.rename_file(old, cand)
+                    ops.append(self.index.rename_file(old, cand))
                 except Exception as e:
                     errors.append(f"{os.path.basename(old)}: {e}")
-        self._apply_everywhere([], renamed)
-        self._report(f"Renamed {len(renamed)} photo(s).", errors)
+        self._apply_ops(ops, f"rename {len(ops)} photo(s)")
+        self._report(f"Renamed {len(ops)} photo(s).", errors)
 
     def _move(self, paths: list[str]):
         dest = QFileDialog.getExistingDirectory(self, f"Move {len(paths)} photo(s) to...")
         if not dest:
             return
-        renamed, errors = {}, []
+        ops, errors = [], []
         for p in paths:
             try:
-                renamed[p] = self.index.move_file(p, dest)
+                ops.append(self.index.move_file(p, dest))
             except Exception as e:
                 errors.append(f"{os.path.basename(p)}: {e}")
-        self._apply_everywhere([], renamed)
-        self._report(f"Moved {len(renamed)} photo(s) to {dest}.", errors)
+        self._apply_ops(ops, f"move {len(ops)} photo(s)")
+        self._report(f"Moved {len(ops)} photo(s) to {dest}.", errors)
 
-    def _delete(self, paths: list[str]):
+    def _delete(self, paths: list[str], confirm: bool = True):
         names = "\n".join("  • " + os.path.basename(p) for p in paths[:12])
         more = f"\n  ...and {len(paths) - 12} more" if len(paths) > 12 else ""
-        if QMessageBox.question(
+        net = any(engine.is_network_path(p) for p in paths)
+        net_note = (f"\n\nNetwork drives have no Recycle Bin, so photos on network folders go to a "
+                    f"\"{engine.NETWORK_DELETED_DIR}\" folder on that drive instead - empty it when you're sure."
+                    if net else "")
+        if confirm and QMessageBox.question(
             self, "Delete photos",
-            f"Move {len(paths)} photo(s) to the Recycle Bin?\n\n{names}{more}\n\n"
-            "You can restore them from the Recycle Bin if needed.",
+            f"Delete {len(paths)} photo(s)?\n\n{names}{more}\n\n"
+            "You can Undo (Ctrl+Z) until you close ItemFinder. After that they are in the Recycle Bin."
+            + net_note,
         ) != QMessageBox.Yes:
             return
-        removed, errors = [], []
+        ops, errors = [], []
         for p in paths:
             try:
-                self.index.delete_file(p)
-                removed.append(p)
+                ops.append(self.index.delete_file(p))
             except Exception as e:
                 errors.append(f"{os.path.basename(p)}: {e}")
-        self._apply_everywhere(removed, {})
-        self._report(f"Moved {len(removed)} photo(s) to the Recycle Bin.", errors)
+        self._apply_ops(ops, f"delete {len(ops)} photo(s)")
+        self._report(f"Deleted {len(ops)} photo(s) - Undo with Ctrl+Z.", errors)
+
+    # ------------------------------------------------------------------ compare / not-duplicates
+    def _compare(self, grid: PhotoGrid, paths: list[str]):
+        if len(paths) >= 2:
+            left, right = paths[0], paths[1]
+        else:
+            others = [p for p in grid.all_paths() if p != paths[0]]
+            if not others:
+                QMessageBox.information(self, APP_NAME, "Tick two photos to compare.")
+                return
+            left, right = paths[0], others[0]
+        a, b = self.index.vector_for(left), self.index.vector_for(right)
+        sim = float(a @ b) if (a is not None and b is not None) else None
+        dlg = compare.CompareDialog(left, right, sim, self)
+        dlg.exec()
+        if dlg.result_action and dlg.result_action[0] == "delete":
+            self._delete([dlg.result_action[1]], confirm=False)
+
+    def _not_duplicates(self, ticked: list[str]):
+        gid = self._current_gid()
+        if gid is None:
+            return
+        group = self.groups.get(gid, [])
+        info = self.group_info.get(gid)
+        others = [p for p in group if p not in ticked]
+        if info:  # item-code group: "this code is fine"
+            members = group if not ticked or not others else ticked + others
+            pairs = [(a, b) for i, a in enumerate(members) for b in members[i + 1:]]
+            self.index.ignore_pairs(pairs)
+            info["ok"] = True
+            self._label_group(self.group_list.currentItem())
+            self.status.setText(f"Item code {info['code']} marked OK - it won't be reported again.")
+            return
+        if not others:  # everything ticked: none of these are duplicates of each other
+            pairs = [(a, b) for i, a in enumerate(group) for b in group[i + 1:]]
+            self.groups[gid] = []
+        else:
+            pairs = [(a, b) for a in ticked for b in others]
+            self.groups[gid] = others
+        self.index.ignore_pairs(pairs)
+        for p in ticked:
+            self.dup_grid.remove_path(p)
+        if not others:
+            self.dup_grid.clear_photos()
+        self._label_group(self.group_list.currentItem())
+        self.status.setText(f"Remembered: {len(ticked) or len(group)} photo(s) are not duplicates "
+                            "- they won't be grouped together again.")
+
+    # ------------------------------------------------------------------ one-click cleanup
+    def cleanup_all(self):
+        groups = {gid: list(g) for gid, g in self.groups.items() if len(g) >= 2}
+        if not groups or self.group_info:
+            return
+        extras = sum(len(g) - 1 for g in groups.values())
+        if QMessageBox.question(
+            self, "Clean up all groups",
+            f"Keep the best copy (highest resolution) in each of {len(groups):,} groups and move the other "
+            f"{extras:,} photo(s) into a \"{engine.DUPLICATES_DIR}\" folder next to them?\n\n"
+            "Nothing is deleted - you can review the _Duplicates folders later, and Undo (Ctrl+Z) "
+            "puts everything back.",
+        ) != QMessageBox.Yes:
+            return
+
+        def work(progress, cancel):
+            ops, errors, kept = [], [], 0
+            for n, (gid, g) in enumerate(groups.items(), 1):
+                if cancel.is_set():
+                    break
+                best = max(g, key=compare.quality_key)
+                kept += 1
+                for p in g:
+                    if p == best:
+                        continue
+                    try:
+                        ops.append(self.index.move_to_duplicates(p))
+                    except Exception as e:
+                        errors.append(f"{os.path.basename(p)}: {e}")
+                progress(n, len(groups), f"Cleaning up group {n:,}/{len(groups):,}...")
+            return ops, errors, kept
+
+        self._set_busy(True)
+        self.btn_cancel.setVisible(True)
+        self.cleanup_worker = FuncWorker(work)
+        self.cleanup_worker.progress.connect(self._progress)
+        self.cleanup_worker.done.connect(self._cleanup_done)
+        self.cleanup_worker.failed.connect(self._error)
+        self.cleanup_worker.start()
+
+    def _cleanup_done(self, result):
+        ops, errors, kept = result
+        self._apply_ops(ops, f"clean up ({len(ops)} photos moved to {engine.DUPLICATES_DIR})")
+        if self.group_list.currentItem() is not None:
+            self._show_group(self.group_list.currentItem())
+        self._end_progress()
+        self._report(f"Cleanup done: kept {kept:,} best copies, moved {len(ops):,} extras into "
+                     f"{engine.DUPLICATES_DIR} folders. Undo with Ctrl+Z.", errors)
+
+    # ------------------------------------------------------------------ Excel export (groups)
+    def export_groups(self):
+        if not self.groups:
+            return
+        code_mode = bool(self.group_info)
+        name = reports.default_report_name("item codes" if code_mode else "duplicates")
+        path, _ = QFileDialog.getSaveFileName(self, "Export to Excel", os.path.join(os.path.expanduser("~"),
+                                              "Desktop", name), "Excel (*.xlsx)")
+        if not path:
+            return
+        groups = {gid: list(g) for gid, g in self.groups.items() if g}
+        infos = {gid: dict(i) for gid, i in self.group_info.items()}
+        index = self.index
+
+        def work(progress, cancel):
+            rows = []
+            for n, (gid, g) in enumerate(sorted(groups.items()), 1):
+                if cancel.is_set():
+                    break
+                info = infos.get(gid)
+                details = {p: compare.photo_details(p) for p in g}
+                if info:
+                    for p in g:
+                        s, odd = info["members"].get(p, (0.0, False))
+                        d = details[p]
+                        status = "OK" if info.get("ok") else ("Looks different" if odd else "Same item")
+                        rows.append([gid + 1, d["code"], d["name"], d["folder"], status,
+                                     engine.to_percent(s), f"{d['w']}x{d['h']}", round(d["size"] / 1024),
+                                     d["modified"], p])
+                else:
+                    if len(g) < 2:
+                        continue
+                    best = max(g, key=lambda p: (details[p]["w"] * details[p]["h"], details[p]["size"]))
+                    ref = index.vector_for(g[0])
+                    for p in g:
+                        d = details[p]
+                        v = index.vector_for(p)
+                        s = float(v @ ref) if (v is not None and ref is not None) else 0.0
+                        rows.append([gid + 1, d["code"], d["name"], d["folder"],
+                                     "Best copy" if p == best else "Extra copy", engine.to_percent(s),
+                                     f"{d['w']}x{d['h']}", round(d["size"] / 1024), d["modified"], p])
+                if n % 50 == 0:
+                    progress(n, len(groups), f"Preparing report {n:,}/{len(groups):,}...")
+            headers = ["Group", "Item code", "File name", "Folder", "Status",
+                       "% like others" if code_mode else "Match %", "Resolution", "Size (KB)", "Modified",
+                       "Full path"]
+            title = "Item code problems" if code_mode else "Duplicates"
+            reports.write_excel(path, [(title, headers, rows)])
+            return path
+
+        self._run_export(work)
+
+    def _run_export(self, work):
+        self._set_busy(True)
+        self.btn_cancel.setVisible(True)
+        self.export_worker = FuncWorker(work)
+        self.export_worker.progress.connect(self._progress)
+        self.export_worker.done.connect(self._export_done)
+        self.export_worker.failed.connect(self._error)
+        self.export_worker.start()
+
+    def _export_done(self, path):
+        self._end_progress(f"Saved report: {path}")
+        box = QMessageBox(self)
+        box.setWindowTitle("Report saved")
+        box.setText(f"Excel report saved:\n{path}")
+        b_open = box.addButton("Open report", QMessageBox.AcceptRole)
+        box.addButton("Close", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is b_open:
+            open_file(path)
 
     def _report(self, msg: str, errors: list[str]):
         self.status.setText(msg)
@@ -1221,9 +1713,17 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e):
         self.cancel_work()
-        for w in (self.scan_worker, self.dup_worker):
+        for w in (self.scan_worker, self.dup_worker, getattr(self, "cleanup_worker", None),
+                  getattr(self, "export_worker", None)):
             if w is not None:
                 w.wait(5000)
+        try:
+            if self.index.held_count():
+                self.status.setText("Moving deleted photos to the Recycle Bin...")
+                QApplication.processEvents()
+                self.index.flush_deleted()
+        except Exception:
+            pass
         super().closeEvent(e)
 
 
@@ -1284,6 +1784,8 @@ def _selftest(out_path: str) -> int:
             model.encode_image(x)
         import send2trash  # noqa: F401
         import safetensors.torch  # noqa: F401  (model file format)
+        import openpyxl  # noqa: F401  (Excel reports)
+        import compare, reports  # noqa: F401,E401
 
         lines.append(f"OK version={version.__version__} torch={torch.__version__} open_clip={open_clip.__version__}")
         code = 0

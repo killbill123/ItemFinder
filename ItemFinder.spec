@@ -15,7 +15,7 @@ binaries = collect_dynamic_libs("torchvision") + [
 datas = collect_data_files("open_clip") + [("assets/itemfinder.ico", "assets")]
 hiddenimports = (
     collect_submodules("open_clip", filter=lambda m: "test" not in m)
-    + ["send2trash", "pillow_heif", "updater", "version", "safetensors", "safetensors.torch"]
+    + ["send2trash", "pillow_heif", "updater", "version", "safetensors", "safetensors.torch", "compare", "reports", "openpyxl"]
 )
 
 excludes = [
